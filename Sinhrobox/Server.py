@@ -108,7 +108,7 @@ if __name__ == '__main__':
         dulj = len (putanja)
         serverName = '192.168.1.11'
         serverPort = int(raw_input('broj porta: '))
-        print 'Aplikacija èeka na promjene servera'
+        print 'Aplikacija Ã¨eka na promjene servera'
         clientSocket = socket (AF_INET, SOCK_STREAM)
         try:
             while 1:
