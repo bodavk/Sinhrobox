@@ -1,139 +1,174 @@
-import time
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
-from socket import *
-import pysftp as sftp
+from os import walk
+from os.path import getmtime
+import ConfigParser
+import io
 import os
-cnopts = sftp.CnOpts()
-cnopts.hostkeys = None
-veza = sftp.Connection('192.168.1.11', username='jurab', password ='jurabaksa', cnopts = cnopts)
-remotepath='/home/jurab/sinhrobox'
-localpath='D:\sinhrobox2'
+import socket
+import json
+import time
+import hashlib
+from ftplib import FTP
+
+def loadConfiguration():
+    with open("clientconf.ini") as f:
+        configFile = f.read()
+    configuration = ConfigParser.RawConfigParser(allow_no_value=True)
+    configuration.readfp(io.BytesIO(configFile))
+    directory = configuration.get('path', 'localdir')
+    serverDirectory = configuration.get('path', 'directory')
+    serverAddress = configuration.get('tcp', 'ip')
+    serverPort = configuration.get('tcp', 'port')
+    sftpAddress = configuration.get('sftp', 'sftpIp')
+    sftpPort = configuration.get('sftp', 'sftpPort')
+    username = configuration.get('user', 'user1')
+    password = configuration.get('user', 'password1')
+    timer = configuration.get('schedule', 'timer')
+    return directory, serverDirectory, serverAddress, serverPort, sftpAddress, sftpPort, username, password, timer
 
 
-#Funkcija za upload putem SFTP
-def sftpUpload(imedatoteke):
+def getFileList(directory):
+    fileList = {}
+    for (directoryPath, directoryName, fileName) in walk(directory):
+        for name in fileName:
+            fileDictionary = {}
+            fileWithPath = directoryPath + '/' + name
+            fileDateTime = getmtime(fileWithPath)
+            fileDictionary['fileModified']=fileDateTime
+            fileDictionary['hashValue']=getFileHash(fileWithPath)
+            fileList[fileWithPath] = fileDictionary
+    return fileList
+
+def getFileHash(filePath):
+    f = open(filePath,'rb')
+    contents = f.read()
+    sha256Checksum = hashlib.sha256(contents).hexdigest()
+    return sha256Checksum
+
+def getServerFileList(address, port):
+    timeout = 3
+    totalData = []
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    serverAddress = (address, int(port))
+    sock.connect(serverAddress)
+
     try:
-        veza.put(localpath + '\\' +imedatoteke,remotepath+'/'+imedatoteke)
-        veza.close
-    except Exception, e:
-        print "failed to upload", str(e)
+        sock.sendall("init")
+    except socket.error:
+        print socket.error.message
 
-#Funkcija za SFTP download
-def sftpDownload(imedatoteke):
-    try:
-        veza.get(remotepath+'/'+imedatoteke, localpath+'\\'+imedatoteke)
-        veza.close
-    except Exception, e:
-        print 'failed to download', str(e)
-
-def sftpDownloadMape():
-    try:
-        veza.get_d(remotepath, localpath)
-        veza.close
-    except Exception, e:
-        print 'failed to download folder', str(e)
-
-#Nadziranje mape na lokalnom disku
-class Watcher:
-    DIRECTORY_TO_WATCH = "D:\\sinhrobox2"
-    def __init__(self):
-        self.observer = Observer()
-
-    def run(self):
-        event_handler = Handler()
-        self.observer.schedule(event_handler, self.DIRECTORY_TO_WATCH, recursive=True)
-        self.observer.start()
+    beginTime = time.time()
+    while True:
+        if totalData and time.time() - beginTime > timeout:
+            break
+        elif time.time() - beginTime > timeout * 2:
+            break
         try:
-            while True:
-                time.sleep(5)
+            data = sock.recv(4096)
+            if data:
+                totalData.append(data)
         except:
-            self.observer.stop()
-            print "Error"
+            pass
+        finally:
+            sock.close()
 
-        self.observer.join()
+    dataReceived = ''.join(totalData)
+    filelist = json.loads(dataReceived)
+    return filelist
 
-    
-#Upravljanje dogadajima
-class Handler(FileSystemEventHandler):
-    @staticmethod
-    def on_any_event(event):
-        
-        DIRECTORY_TO_WATCH="D:\\sinhrobox2" 
+def stripRootDir(fileName, rootDirString):
+    return fileName[0 + len(rootDirString):]
 
-        duljina = len(DIRECTORY_TO_WATCH)+1
-        ime_datoteke_upload = event.src_path[duljina:]
-        ime_datoteke = event.src_path[duljina:]
+def listContainsFile(listOfFiles, fileName, fileNamePath, itemPath):
+    for file in listOfFiles:
+        if stripRootDir(file, itemPath).encode('utf-8') == stripRootDir(fileName, fileNamePath).encode('utf-8'):
+            return True, file
+    return False, None
 
-        if event.is_directory:
-            return None
+def getFileDateAndHash(fileName, fileList):
+    date = fileList.get(fileName).get('fileModified')
+    hash = fileList.get(fileName).get('hashValue')
+    return date,hash
 
-        elif event.event_type == 'modified':# or event.event_type == 'created':
-            # Ako je datoteka KREIRANA ILI MODIFICIRANA
-            print "Kreirana je ili izmjenjena datoteka: - %s." % ime_datoteke_upload
-            print "Uploadam %s na server" %ime_datoteke_upload
-            sftpUpload(ime_datoteke_upload) 
-            print "Uploaded"
-            
-        elif event.event_type == 'deleted':
-            # Ako je datoteka BRISANA
-            print "Obrisana datoteka: -%s" %event.src_path
-            print "Brisem sa servera: -%s" %ime_datoteke_upload         
-            """
-            BRISANJE DATOTEKE - Ovaj dio bi trebao brisati datoteku na serveru ukoliko se obrise na lokalnom disku"""
-            string = 'rm "' + remotepath + '/' +ime_datoteke + '"'
-            print ('izvrsavam %s') %string
-            
-            try: veza.execute(string)
+def fileChanged(fileListRemote, fileListLocal, localFileName, remoteFileName):
+    remoteFileDate, remoteFileHash = getFileDateAndHash(remoteFileName, fileListRemote)
+    localFileDate, localFileHash = getFileDateAndHash(localFileName, fileListLocal)
+    if localFileHash == remoteFileHash:
+        return 0
+    elif localFileDate > remoteFileDate:
+        return 1
+    else:
+        return 2
+
+def setFTPConnection(userName, password, sftpServerAddress, serverPort, localPath):
+    ftp = FTP('')
+    ftp.connect(sftpServerAddress, serverPort)
+    ftp.login(userName,password)
+    return ftp
+
+def uploadLocalFileToRemote(fileName, connection, localDirectory):
+    strippedName = stripRootDir(fileName, localDirectory)
+    strippedName = strippedName[1:]
+    os.chdir(localDirectory)
+    try:
+        connection.storbinary('STOR '+strippedName, open(strippedName, 'rb'))
+        print("Uploaded -"+strippedName)
+    except Exception, e:
+        print(str(e))
+    finally:
+        connection.quit()
+
+def downloadFileFromRemote(strippedName, connection, localDirectory):
+    os.chdir(localDirectory)
+    try:
+        localFile = open(localDirectory+"/"+strippedName, 'wb')
+        connection.retrbinary('RETR '+strippedName, localFile.write, 1024)
+        print ("Downloaded - "+ strippedName)
+    except Exception, e:
+        print(str(e))
+    finally:
+        connection.quit()
+        localFile.close()
+
+
+def synchronize(directory, serverDirectory, serverAddress, serverPort, sftpAddress, sftpPort, username, password):
+    fileListRemote = getServerFileList(serverAddress, serverPort)
+    fileListLocal = getFileList(directory)
+    for item in fileListLocal:
+        containsFile, fileName =  listContainsFile (fileListRemote,item,directory,serverDirectory)
+        if containsFile:
+            connection = setFTPConnection(username, password, sftpAddress, sftpPort, directory)
+            fileAge = fileChanged(fileListRemote, fileListLocal, item, fileName)
+            try:
+
+                if fileAge == 1:
+                    uploadLocalFileToRemote(item, connection, directory)
+                elif fileAge == 2:
+                    strippedName = stripRootDir(item, directory)
+                    downloadFileFromRemote(strippedName, connection, directory)
+                else:
+                    print "No changes in files"
             except Exception, e:
-                print 'Brisanje neuspjesno', str (e)
-         #preimenovanje datoteke   
-        elif event.event_type == 'moved':
-            novo_ime_datoteke = event.dest_path[duljina:]
-            string = 'mv "' + remotepath + '/' +ime_datoteke + '" "'+remotepath + '/' + novo_ime_datoteke + '"'
-            print "Preimenovana ili premjestena datoteka iz%s u -%s" %(ime_datoteke_upload,novo_ime_datoteke)
-            print string
-            veza.execute(string)
-        
+                print(str(e))
+        # TODO take into two methods - check whatLocalHasServerDoesnt and check whatServerHasAndLocalDoesnt
+        else:
+            connection = setFTPConnection(username, password, sftpAddress, sftpPort, directory)
+            uploadLocalFileToRemote(item, connection, directory)
+    for item in fileListRemote:
+        fileListLocal = getFileList(directory)
+        containsFile, fileName = listContainsFile(fileListLocal, item, serverDirectory, directory)
+        if not containsFile:
+            connection = setFTPConnection(username, password, sftpAddress, sftpPort, directory)
+            strippedName = stripRootDir(item,serverDirectory)
+            downloadFileFromRemote(strippedName,connection,directory)
 
-if __name__ == '__main__':
-    mod_rada = raw_input('Mod rada 0 - upload i odasiljanje mape serveru ili 1-sinhronizacija sa serverom 2-download kompletne mape (0/1/2):')
-
-    if mod_rada == '0': 
-        w = Watcher()
-        w.run()
-        
-    elif mod_rada == '1':
-        putanja = '/home/jurab/sinhrobox'
-        dulj = len (putanja)
-        serverName = '192.168.1.11'
-        serverPort = int(raw_input('broj porta: '))
-        print 'Aplikacija èeka na promjene servera'
-        clientSocket = socket (AF_INET, SOCK_STREAM)
-        try:
-            while 1:
-                clientSocket.connect((serverName, serverPort))
-                poruka = clientSocket.recv(1024)
-                print 'primljeno'
-                print 'poruka je :%s' %poruka
-                kod = poruka[:1]
-                print 'kod = %s' %kod
-                putanja_datoteke_na_serveru = poruka[1:]
-                print 'putanja = %s' %putanja_datoteke_na_serveru
-                ime_datoteke_na_serveru = putanja_datoteke_na_serveru[dulj+1:]
-                print ('ime datoteke na serveru = %s') %ime_datoteke_na_serveru
-                if kod == '1':
-                    sftpDownload(ime_datoteke_na_serveru)
-                    print 'preuzeta datoteka :%s ' %ime_datoteke_na_serveru
-                if kod == '2':
-                    print 'obrisana' %ime_datoteke_na_serveru
-                    putanja = localpath+'\\'+ime_datoteke_na_serveru
-                    print putanja
-                    os.remove(putanja)
-        except Exception as e:
-            print 'keyboard interrupt'
-            print e
-            clientSocket.close()
-    elif mod_rada == '2':
-        sftpDownloadMape()
-        
+if __name__ == "__main__":
+    directory, serverDirectory, serverAddress, serverPort, sftpAddress, sftpPort, username, password, timer = loadConfiguration()
+    while True:
+        timerStart = time.time()
+        synchronize(directory, serverDirectory, serverAddress, serverPort, sftpAddress, sftpPort, username, password)
+        timerFinished = time.time()
+        timePassed = timerFinished - timerStart
+        sleepingTime = int(timer) - timePassed
+        print("Sleeping for "+ str(sleepingTime))
+        time.sleep(sleepingTime)
